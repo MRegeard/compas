@@ -4,19 +4,19 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const mod = b.addModule("compa", .{
-        .root_source_file = b.path("src/root.zig"),
+    const mod = b.addModule("compas", .{
+        .root_source_file = b.path("src/compas.zig"),
         .target = target,
     });
 
     const exe = b.addExecutable(.{
-        .name = "compa",
+        .name = "compas",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "compa", .module = mod },
+                .{ .name = "compas", .module = mod },
             },
         }),
     });
@@ -49,5 +49,4 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
-
 }
