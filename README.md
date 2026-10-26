@@ -1,1 +1,1 @@
-# Compas: A Zig command line argument parser.
+# Compas: A Zig command line arguments parser.
