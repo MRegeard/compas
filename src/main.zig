@@ -3,13 +3,13 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const Args = std.process.Args;
 
-const compa = @import("compa");
-const Command = compa.Command;
-const Cli = compa.Cli;
-const Option = compa.Option;
+const compas = @import("compas");
+const Command = compas.Command;
+const Cli = compas.Cli;
+const Option = compas.Option;
 
 const InitHandler = struct {
-    pub fn run(gpa: Allocator, opts: init_command.options) !void {
+    pub fn run(gpa: Allocator, opts: init_command.Options) !void {
         _ = gpa;
         std.debug.print("Init: force = {any}\n", .{opts.force});
     }
@@ -17,11 +17,11 @@ const InitHandler = struct {
 const init_command: Command = .{
     .name = "init",
     .description = "initialize ...",
-    .handler = InitHandler,
-    .options = struct {
+    .Handler = InitHandler,
+    .Options = struct {
         force: usize = 0,
     },
-    .option_info = &.{
+    .options_info = &.{
         .{
             .longname = "force",
             .shortname = "f",
@@ -38,7 +38,7 @@ const VersionHandler = struct {
 const version_command: Command = .{
     .name = "version",
     .description = "Version ...",
-    .handler = VersionHandler,
+    .Handler = VersionHandler,
 };
 
 const Context = struct {
@@ -46,7 +46,7 @@ const Context = struct {
     io: Io,
 };
 
-const commands: [2]compa.Command = .{ init_command, version_command };
+const commands: [2]compas.Command = .{ init_command, version_command };
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();

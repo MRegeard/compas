@@ -1,44 +1,21 @@
 const std = @import("std");
-const Args = std.process.Args;
-const Io = std.Io;
-const Allocator = std.mem.Allocator;
+const Command = @import("command.zig").Command;
 
-pub const PositionalArgument = struct {
-    arg_type: type,
-    type_info: std.builtin.Type,
-    delimiter: u8 = ' ',
-
-    pub fn init(comptime t: type) PositionalArgument {
-        const info = @typeInfo(t);
-        return switch (info) {
-            .int,
-            .float,
-            .bool,
-            => .{ .arg_type = t, .type_info = info },
-            .pointer => |ptr| {
-                if (ptr.size == .slice and ptr.is_const and ptr.child == u8) .{ .arg_type = t, .type_info = info };
-                @compileError("Unsupported expected type, int, float, bool and string slice ([]const u8) are currently supported.");
-            },
-            else => @compileError("Unsupported expected type, int, float, bool and string slice ([]const u8) are currently supported."),
-        };
+fn validateType(comptime T: type) void {
+    inline for (@typeInfo(T).@"struct".fields) |field| {
+        switch (@typeInfo(field.type)) {
+            .int, .float, .bool => return,
+            .optional => |o| return validateType(@typeInfo(o).optional.child),
+            else => if (field.type == []const u8) return else @compileError("Unsupported type " ++ @typeName(field.type) ++ " for options."),
+        }
     }
-};
-
-pub const OptionInfo = struct {
-    longname: []const u8,
-    shortname: []const u8,
-    description: []const u8 = "",
-};
-
-pub const Command = struct {
-    name: []const u8,
-    description: []const u8 = "",
-    options: type = struct {},
-    handler: ?type = null,
-    option_info: []const OptionInfo = &.{},
-};
+}
 
 pub fn Cli(comptime Context: type, comptime commands: []const Command) type {
+    for (commands) |cmd| {
+        validateType(cmd.Options);
+        validateType(cmd.Positionals);
+    }
     const cmds_len: usize = commands.len;
     return struct {
         pub const Tag = blk: {
@@ -71,8 +48,7 @@ pub fn Cli(comptime Context: type, comptime commands: []const Command) type {
 
         fn Payload(comptime command: Command) type {
             return struct {
-                // parseOption here
-                options: command.options,
+                options: command.Options,
             };
         }
 
@@ -89,8 +65,8 @@ pub fn Cli(comptime Context: type, comptime commands: []const Command) type {
         }
 
         // For testing only 1 arg is parse as option, only bool options.
-        fn parseOptions(comptime cmd: Command, args: []const [:0]const u8) !cmd.options {
-            const Options = cmd.options;
+        fn parseOptions(comptime cmd: Command, args: []const [:0]const u8) !cmd.Options {
+            const Options = cmd.Options;
             var options: Options = .{};
             var i: usize = 0;
             while (i < args.len) : (i += 1) {
@@ -135,7 +111,7 @@ pub fn Cli(comptime Context: type, comptime commands: []const Command) type {
         }
 
         fn shortFor(comptime cmd: Command, comptime field_name: []const u8) ?[]const u8 {
-            for (cmd.option_info) |info| {
+            for (cmd.options_info) |info| {
                 if (std.mem.eql(u8, info.longname, field_name)) return info.shortname;
             }
             return null;
@@ -150,14 +126,14 @@ pub fn Cli(comptime Context: type, comptime commands: []const Command) type {
             }
         }
 
-        fn call(comptime command: Command, ctx: Context, opts: command.options) !void {
-            const F = @TypeOf(command.handler.?.run);
+        fn call(comptime command: Command, ctx: Context, opts: command.Options) !void {
+            const F = @TypeOf(command.Handler.?.run);
             var args: std.meta.ArgsTuple(F) = undefined;
             inline for (@typeInfo(F).@"fn".params, 0..) |param, i| {
                 const T = param.type orelse @compileError("Generic parameters not supported in run.");
-                args[i] = if (T == command.options) opts else if (T == Context) ctx else fromContext(T, ctx);
+                args[i] = if (T == command.Options) opts else if (T == Context) ctx else fromContext(T, ctx);
             }
-            return @call(.auto, command.handler.?.run, args);
+            return @call(.auto, command.Handler.?.run, args);
         }
 
         fn fromContext(comptime T: type, ctx: Context) T {
