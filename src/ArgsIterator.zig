@@ -50,6 +50,13 @@ pub fn reset(self: *ArgsIterator) void {
     self.seek = 0;
 }
 
+/// Skip 1 argument without capturing it. Returns `true` if skipped an arg, `false` if at the end.
+pub fn skip(self: *ArgsIterator) bool {
+    if (self.buffer[self.seek..].len == 0) return false;
+    self.seek += 1;
+    return true;
+}
+
 test next {
     const args: []const [:0]const u8 = &.{ "abc", "def", "ghi" };
     var it = ArgsIterator.init(args);
@@ -95,4 +102,15 @@ test reset {
     _ = it.next();
     it.reset();
     try testing.expectEqual(0, it.seek);
+}
+
+test skip {
+    const args: []const [:0]const u8 = &.{ "abc", "def" };
+    var it = ArgsIterator.init(args);
+    try testing.expect(it.skip());
+    try testing.expectEqual(it.seek, 1);
+    try testing.expect(it.skip());
+    try testing.expectEqual(it.seek, 2);
+    try testing.expect(!it.skip());
+    try testing.expectEqual(it.seek, 3);
 }
