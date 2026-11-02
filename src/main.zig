@@ -9,26 +9,33 @@ const Cli = compas.Cli;
 const Option = compas.Option;
 
 const InitHandler = struct {
-    pub fn run(gpa: Allocator, opts: init_command.Options) !void {
+    pub fn run(gpa: Allocator, pos: init_command.Positionals, opts: init_command.Options) !void {
         _ = gpa;
-        std.debug.print("Init: force = {any}\n", .{opts.force});
+        std.debug.print("Init: {s}, force = {any}, verbose = {any}, some = {any}\n", .{ pos.name, opts.force, opts.verbose, opts.some });
     }
 };
-const init_command: Command = .{
-    .name = "init",
-    .description = "initialize ...",
-    .Handler = InitHandler,
-    .Options = struct {
-        force: usize = 0,
-    },
-    .options_info = &.{
-        .{
-            .longname = "force",
-            .shortname = "f",
-            .description = "Force ...",
-        },
-    },
-};
+const init_command: Command = .{ .name = "init", .description = "initialize ...", .Handler = InitHandler, .Options = struct {
+    force: usize = 0,
+    verbose: bool = false,
+    some: bool = false,
+}, .Positionals = struct {
+    name: []const u8,
+}, .options_info = &.{ .{
+    .longname = "force",
+    .shortname = "f",
+    .description = "Force ...",
+}, .{
+    .longname = "verbose",
+    .shortname = "v",
+    .description = "Verbose ...",
+}, .{
+    .longname = "some",
+    .shortname = "s",
+    .description = "Some ...",
+} }, .positionals_info = &.{.{
+    .name = "dir",
+    .description = "Folder name to init",
+}} };
 
 const VersionHandler = struct {
     pub fn run() !void {
