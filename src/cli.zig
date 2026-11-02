@@ -139,15 +139,49 @@ pub fn Cli(comptime Context: type, comptime commands: []const Command) type {
             return error.TooManyPositionalArguments;
         }
 
+        fn shortChar(comptime cmd: Command, field_name: []const u8) ?u8 {
+            const s = shortFor(cmd, field_name) orelse return null;
+            if (s.len != 1) @compileError("Short name '" ++ s ++ "' for option '" ++ field_name ++ "' must be one character.");
+            return s[0];
+        }
+
+        fn parseShortCluster(comptime cmd: Command, options: *cmd.Options, arg: []const u8, arg_it: *ArgsIterator) !void {
+            var i: usize = 1; // skip '-'
+            while (i < arg.len) : (i += 1) {
+                const char = arg[i];
+                const matched = inline for (@typeInfo(cmd.Options).@"struct".fields) |field| {
+                    if (comptime shortChar(cmd, field.name)) |s| {
+                        if (s == char) {
+                            if (field.type == bool) {
+                                @field(options.*, field.name) = true;
+                            } else {
+                                const rest = arg[i + 1 ..];
+                                if (rest.len > 0 and rest[0] == '=') return error.ShortFlagEqualValueSyntaxError;
+                                const value = if (rest.len > 0) rest else (arg_it.next() orelse return error.MissingValue);
+                                @field(options.*, field.name) = try parseValue(field.type, value);
+                                return;
+                            }
+                            break true;
+                        }
+                    }
+                } else false;
+                if (!matched) return error.UnknownOption;
+            }
+        }
+
         fn parseOption(comptime cmd: Command, options: *cmd.Options, arg: []const u8, arg_it: *ArgsIterator) !void {
+            if (!std.mem.startsWith(u8, arg, "--")) return parseShortCluster(cmd, options, arg, arg_it);
+
+            const arg_name: []const u8, const inline_value: ?[]const u8 =
+                if (std.mem.indexOfScalar(u8, arg, '=')) |i| .{ arg[2..i], arg[i + 1 ..] } else .{ arg[2..], null };
+
             inline for (@typeInfo(cmd.Options).@"struct".fields) |field| {
-                const short = comptime shortFor(cmd, field.name);
-                if (matches(field.name, short, arg)) {
+                if (std.mem.eql(u8, arg_name, field.name)) {
                     if (field.type == bool) {
-                        @field(options, field.name) = true;
+                        @field(options.*, field.name) = if (inline_value) |v| try parseValue(field.type, v) else true;
                     } else {
-                        const value = arg_it.next() orelse return error.Missingvalue;
-                        @field(options, field.name) = try parseValue(field.type, value);
+                        const value = inline_value orelse (arg_it.next() orelse return error.MissingValue);
+                        @field(options.*, field.name) = try parseValue(field.type, value);
                     }
                     return;
                 }
