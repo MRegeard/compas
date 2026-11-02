@@ -79,54 +79,64 @@ pub fn Cli(comptime Context: type, comptime commands: []const Command) type {
         }
 
         fn parseCommandArgs(comptime cmd: Command, arg_it: *ArgsIterator) !Payload(cmd) {
-            const required_positionals = comptime countRequired(cmd.Positionals);
+            const required_positionals = comptime countRequiredPositional(cmd);
+
             var res: Payload(cmd) = .{
                 .options = .{},
-                .positionals = initPositionals(cmd.Positionals),
+                .positionals = initPositional(cmd),
             };
-
             var pos_index: usize = 0;
-            var only_positional = false;
+            var only_positonal: bool = false;
 
             while (arg_it.next()) |arg| {
-                if (!only_positional and std.mem.eql(u8, arg, "--")) {
-                    only_positional = true;
-                } else if (!only_positional and arg.len > 1 and arg[0] == '-') {
+                if (!only_positonal and std.mem.eql(u8, arg, "--")) {
+                    only_positonal = true;
+                } else if (!only_positonal and arg.len > 1 and arg[0] == '-') {
                     try parseOption(cmd, &res.options, arg, arg_it);
                 } else {
-                    try setPositional(cmd.Positionals, &res.positionals, pos_index, arg);
+                    try setPositional(cmd, &res.positionals, pos_index, arg);
                     pos_index += 1;
                 }
             }
-            if (pos_index < required_positionals) return error.MissingPositionalArgument;
+            if (pos_index < required_positionals) return error.MissingPositionalArguements;
             return res;
         }
 
-        fn countRequired(comptime Positionals: type) usize {
+        fn countRequiredPositional(comptime cmd: Command) usize {
             var n: usize = 0;
             var seen_optional: bool = false;
-            for (@typeInfo(Positionals).@"struct".fields) |field| {
+            inline for (@typeInfo(cmd.Positionals).@"struct".fields) |field| {
                 const is_optional = field.default_value_ptr != null or @typeInfo(field.type) == .optional;
                 if (is_optional) {
                     seen_optional = true;
                 } else {
-                    if (seen_optional) @compileError("Required positional '" ++ field.name ++ "' follows an optional one.");
+                    if (seen_optional) @compileError("Required postional '" ++ field.name ++ "' follows an optional one.");
                     n += 1;
                 }
             }
             return n;
         }
 
-        fn initPositionals(comptime Positionals: type) Positionals {
-            var p: Positionals = undefined;
-            inline for (@typeInfo(Positionals).@"struct".fields) |field| {
+        fn initPositional(comptime cmd: Command) cmd.Positionals {
+            var p: cmd.Positionals = undefined;
+            inline for (@typeInfo(cmd.Positionals).@"struct".fields) |field| {
                 if (field.defaultValue()) |default| {
                     @field(p, field.name) = default;
                 } else if (@typeInfo(field.type) == .optional) {
-                    @field(p, field.field.name) == null;
+                    @field(p, field.name) = null;
                 }
             }
             return p;
+        }
+
+        fn setPositional(comptime cmd: Command, positionals: *cmd.Positionals, index: usize, arg: []const u8) !void {
+            inline for (@typeInfo(cmd.Positionals).@"struct".fields, 0..) |field, i| {
+                if (i == index) {
+                    @field(positionals.*, field.name) = try parseValue(field.type, arg);
+                    return;
+                }
+            }
+            return error.TooManyPositionalArguments;
         }
 
         fn parseOption(comptime cmd: Command, options: *cmd.Options, arg: []const u8, arg_it: *ArgsIterator) !void {
@@ -143,16 +153,6 @@ pub fn Cli(comptime Context: type, comptime commands: []const Command) type {
                 }
             }
             return error.UnknownOption;
-        }
-
-        fn setPositional(comptime Positionals: type, pos: *Positionals, index: usize, arg: []const u8) !void {
-            inline for (@typeInfo(Positionals).@"struct".fields, 0..) |field, i| {
-                if (i == index) {
-                    @field(pos.*, field.name) = try parseValue(field.type, arg);
-                    return;
-                }
-            }
-            return error.TooManyPositionalArguments;
         }
 
         fn parseValue(comptime T: type, arg: []const u8) !T {
