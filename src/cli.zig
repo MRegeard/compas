@@ -1,20 +1,26 @@
 const std = @import("std");
+const assert = std.debug.assert;
+const builtin = @import("builtin");
 const Command = @import("command.zig").Command;
+const ArgsIterator = @import("ArgsIterator.zig");
 
-fn validateType(comptime T: type) void {
-    inline for (@typeInfo(T).@"struct".fields) |field| {
-        switch (@typeInfo(field.type)) {
-            .int, .float, .bool => return,
-            .optional => |o| return validateType(@typeInfo(o).optional.child),
-            else => if (field.type == []const u8) return else @compileError("Unsupported type " ++ @typeName(field.type) ++ " for options."),
-        }
+fn validateFields(comptime T: type) void {
+    for (@typeInfo(T).@"struct".fields) |field| validateFieldType(field.type);
+}
+
+fn validateFieldType(comptime T: type) void {
+    switch (@typeInfo(T)) {
+        .int, .float, .bool => {},
+        .optional => |o| validateFieldType(o.child),
+        else => if (T != []const u8)
+            @compileError("Unsupported type " ++ @typeName(T) ++ " for options/positionals."),
     }
 }
 
 pub fn Cli(comptime Context: type, comptime commands: []const Command) type {
     for (commands) |cmd| {
-        validateType(cmd.Options);
-        validateType(cmd.Positionals);
+        validateFields(cmd.Options);
+        validateFields(cmd.Positionals);
     }
     const cmds_len: usize = commands.len;
     return struct {
@@ -49,50 +55,113 @@ pub fn Cli(comptime Context: type, comptime commands: []const Command) type {
         fn Payload(comptime command: Command) type {
             return struct {
                 options: command.Options,
+                positionals: command.Positionals,
             };
         }
 
         pub fn parse(args: []const [:0]const u8) !Parsed {
-            if (args.len < 2) return error.MissingCommand;
-            const tag = std.meta.stringToEnum(Tag, args[1]) orelse return error.UnknownCommand;
-            return switch (tag) {
-                inline else => |t| blk: {
-                    const cmd = commands[@intFromEnum(t)];
-                    const options = try parseOptions(cmd, args[2..]);
-                    break :blk @unionInit(Parsed, @tagName(t), .{ .options = options });
-                },
-            };
+            var arg_it = ArgsIterator.init(args);
+            _ = arg_it.skip();
+            if (arg_it.next()) |command_name| {
+                const tag = std.meta.stringToEnum(Tag, command_name) orelse return error.UnknownCommand;
+                return switch (tag) {
+                    inline else => |t| blk: {
+                        const cmd = commands[@intFromEnum(t)];
+                        const parse_res = try parseCommandArgs(cmd, &arg_it);
+                        break :blk @unionInit(Parsed, @tagName(t), .{
+                            .options = parse_res.options,
+                            .positionals = parse_res.positionals,
+                        });
+                    },
+                };
+            }
+            return error.MissingCommand;
         }
 
-        // For testing only 1 arg is parse as option, only bool options.
-        fn parseOptions(comptime cmd: Command, args: []const [:0]const u8) !cmd.Options {
-            const Options = cmd.Options;
-            var options: Options = .{};
-            var i: usize = 0;
-            while (i < args.len) : (i += 1) {
-                const arg = args[i];
-                matched: {
-                    inline for (@typeInfo(Options).@"struct".fields) |field| {
-                        const short = comptime shortFor(cmd, field.name);
-                        if (matches(field.name, short, arg)) {
-                            if (field.type == bool) {
-                                @field(options, field.name) = true;
-                            } else {
-                                i += 1;
-                                if (i >= args.len) return error.MissingValue;
-                                @field(options, field.name) = try parseValue(field.type, args[i]);
-                            }
-                            break :matched;
-                        }
-                    }
-                    return error.UnknownOption;
+        fn parseCommandArgs(comptime cmd: Command, arg_it: *ArgsIterator) !Payload(cmd) {
+            const required_positionals = comptime countRequired(cmd.Positionals);
+            var res: Payload(cmd) = .{
+                .options = .{},
+                .positionals = initPositionals(cmd.Positionals),
+            };
+
+            var pos_index: usize = 0;
+            var only_positional = false;
+
+            while (arg_it.next()) |arg| {
+                if (!only_positional and std.mem.eql(u8, arg, "--")) {
+                    only_positional = true;
+                } else if (!only_positional and arg.len > 1 and arg[0] == '-') {
+                    try parseOption(cmd, &res.options, arg, arg_it);
+                } else {
+                    try setPositional(cmd.Positionals, &res.positionals, pos_index, arg);
+                    pos_index += 1;
                 }
             }
-            return options;
+            if (pos_index < required_positionals) return error.MissingPositionalArgument;
+            return res;
+        }
+
+        fn countRequired(comptime Positionals: type) usize {
+            var n: usize = 0;
+            var seen_optional: bool = false;
+            for (@typeInfo(Positionals).@"struct".fields) |field| {
+                const is_optional = field.default_value_ptr != null or @typeInfo(field.type) == .optional;
+                if (is_optional) {
+                    seen_optional = true;
+                } else {
+                    if (seen_optional) @compileError("Required positional '" ++ field.name ++ "' follows an optional one.");
+                    n += 1;
+                }
+            }
+            return n;
+        }
+
+        fn initPositionals(comptime Positionals: type) Positionals {
+            var p: Positionals = undefined;
+            inline for (@typeInfo(Positionals).@"struct".fields) |field| {
+                if (field.defaultValue()) |default| {
+                    @field(p, field.name) = default;
+                } else if (@typeInfo(field.type) == .optional) {
+                    @field(p, field.field.name) == null;
+                }
+            }
+            return p;
+        }
+
+        fn parseOption(comptime cmd: Command, options: *cmd.Options, arg: []const u8, arg_it: *ArgsIterator) !void {
+            inline for (@typeInfo(cmd.Options).@"struct".fields) |field| {
+                const short = comptime shortFor(cmd, field.name);
+                if (matches(field.name, short, arg)) {
+                    if (field.type == bool) {
+                        @field(options, field.name) = true;
+                    } else {
+                        const value = arg_it.next() orelse return error.Missingvalue;
+                        @field(options, field.name) = try parseValue(field.type, value);
+                    }
+                    return;
+                }
+            }
+            return error.UnknownOption;
+        }
+
+        fn setPositional(comptime Positionals: type, pos: *Positionals, index: usize, arg: []const u8) !void {
+            inline for (@typeInfo(Positionals).@"struct".fields, 0..) |field, i| {
+                if (i == index) {
+                    @field(pos.*, field.name) = try parseValue(field.type, arg);
+                    return;
+                }
+            }
+            return error.TooManyPositionalArguments;
         }
 
         fn parseValue(comptime T: type, arg: []const u8) !T {
             return switch (@typeInfo(T)) {
+                .bool => {
+                    if (std.ascii.eqlIgnoreCase(arg, "true")) return true;
+                    if (std.ascii.eqlIgnoreCase(arg, "false")) return false;
+                    return error.ParseBoolError;
+                },
                 .int => try std.fmt.parseInt(T, arg, 0),
                 .float => try std.fmt.parseFloat(T, arg),
                 .optional => |o| try parseValue(o.child, arg),
@@ -121,17 +190,22 @@ pub fn Cli(comptime Context: type, comptime commands: []const Command) type {
             switch (parsed) {
                 inline else => |payload, tag| {
                     const cmd = commands[@intFromEnum(tag)];
-                    try call(cmd, ctx, payload.options);
+                    try call(cmd, ctx, payload);
                 },
             }
         }
 
-        fn call(comptime command: Command, ctx: Context, opts: command.Options) !void {
+        fn call(comptime command: Command, ctx: Context, payload: Payload(command)) !void {
             const F = @TypeOf(command.Handler.?.run);
             var args: std.meta.ArgsTuple(F) = undefined;
             inline for (@typeInfo(F).@"fn".params, 0..) |param, i| {
                 const T = param.type orelse @compileError("Generic parameters not supported in run.");
-                args[i] = if (T == command.Options) opts else if (T == Context) ctx else fromContext(T, ctx);
+                args[i] = blk: {
+                    if (T == command.Options) break :blk payload.options;
+                    if (T == Context) break :blk ctx;
+                    if (T == command.Positionals) break :blk payload.positionals;
+                    break :blk fromContext(T, ctx);
+                };
             }
             return @call(.auto, command.Handler.?.run, args);
         }
