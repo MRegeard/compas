@@ -1,6 +1,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const builtin = @import("builtin");
+const Io = std.Io;
 const Command = @import("command.zig").Command;
 const ArgsIterator = @import("ArgsIterator.zig");
 
@@ -17,18 +18,39 @@ fn validateFieldType(comptime T: type) void {
     }
 }
 
-pub fn Cli(comptime Context: type, comptime commands: []const Command) type {
+pub const ParseError = error{
+    UnknownCommand,
+    MissingCommand,
+    MissingPositionalArguements,
+    TooManyPositionalArguments,
+    ShortFlagEqualValueSyntaxError,
+    MissingValue,
+    UnknownOption,
+    ParseBoolError,
+} || std.fmt.ParseFloatError || std.fmt.ParseIntError;
+
+pub const Config = struct {
+    usage: enum { auto, custom } = .auto,
+    helper: enum { auto, custom } = .auto,
+    program_name: ?[]const u8 = null,
+    program_description: ?[]const u8 = null,
+};
+
+pub fn Cli(comptime Context: type, comptime commands: []const Command, comptime config: Config) type {
+    _ = config;
     for (commands) |cmd| {
         validateFields(cmd.Options);
         validateFields(cmd.Positionals);
     }
+
     const cmds_len: usize = commands.len;
     return struct {
         pub const Tag = blk: {
-            const TagType: type = std.math.IntFittingRange(0, commands.len);
+            const TagType: type = std.math.IntFittingRange(0, cmds_len + 1);
             var names: [cmds_len][]const u8 = undefined;
             var values: [cmds_len]TagType = undefined;
             for (commands, 0..) |cmd, i| {
+                if (std.mem.eql(u8, cmd.name, "help")) @compileError("'help' is a reserved command name.");
                 names[i] = cmd.name;
                 values[i] = i;
             }
@@ -37,7 +59,7 @@ pub fn Cli(comptime Context: type, comptime commands: []const Command) type {
             break :blk @Enum(TagType, .exhaustive, &n, &v);
         };
 
-        pub const Parsed = blk: {
+        pub const Invoked = blk: {
             var field_names: [cmds_len][]const u8 = undefined;
             var field_types: [cmds_len]type = undefined;
             var field_attrs: [cmds_len]std.builtin.Type.UnionField.Attributes = undefined;
@@ -52,6 +74,19 @@ pub fn Cli(comptime Context: type, comptime commands: []const Command) type {
             break :blk @Union(.auto, Tag, &n, &t, &a);
         };
 
+        pub const ParseResult = union(enum) {
+            command: Invoked,
+            help: ?Tag,
+            err: Diagnostic,
+        };
+
+        pub const Diagnostic = struct {
+            tag: ?Tag = null,
+            kind: ParseError = error.UnknownCommand,
+            arg: ?[]const u8 = null,
+            name: ?[]const u8 = null,
+        };
+
         fn Payload(comptime command: Command) type {
             return struct {
                 options: command.Options,
@@ -59,26 +94,39 @@ pub fn Cli(comptime Context: type, comptime commands: []const Command) type {
             };
         }
 
-        pub fn parse(args: []const [:0]const u8) !Parsed {
+        fn fail(diag: *Diagnostic, kind: ParseError, arg: ?[]const u8, name: ?[]const u8) ParseError {
+            diag.kind = kind;
+            diag.arg = arg;
+            diag.name = name;
+            return kind;
+        }
+
+        fn isHelp(name: []const u8) bool {
+            return std.mem.eql(u8, name, "--help") or std.mem.eql(u8, name, "-h");
+        }
+
+        pub fn parse(args: []const [:0]const u8) ParseResult {
             var arg_it = ArgsIterator.init(args);
             _ = arg_it.skip();
             if (arg_it.next()) |command_name| {
-                const tag = std.meta.stringToEnum(Tag, command_name) orelse return error.UnknownCommand;
-                return switch (tag) {
-                    inline else => |t| blk: {
+                if (isHelp(command_name)) return .{ .help = null };
+                const tag = std.meta.stringToEnum(Tag, command_name) orelse return .{ .err = .{ .tag = null, .kind = error.UnknownCommand, .arg = command_name } };
+                switch (tag) {
+                    inline else => |t| {
+                        var diag: Diagnostic = .{ .tag = t };
                         const cmd = commands[@intFromEnum(t)];
-                        const parse_res = try parseCommandArgs(cmd, &arg_it);
-                        break :blk @unionInit(Parsed, @tagName(t), .{
-                            .options = parse_res.options,
-                            .positionals = parse_res.positionals,
-                        });
+                        const payload = (parseCommandArgs(cmd, &arg_it, &diag) catch |err| {
+                            assert(diag.kind == err);
+                            return .{ .err = diag };
+                        }) orelse return .{ .help = t };
+                        return .{ .command = @unionInit(Invoked, @tagName(t), payload) };
                     },
-                };
+                }
             }
-            return error.MissingCommand;
+            return .{ .err = .{ .kind = error.MissingCommand } };
         }
 
-        fn parseCommandArgs(comptime cmd: Command, arg_it: *ArgsIterator) !Payload(cmd) {
+        fn parseCommandArgs(comptime cmd: Command, arg_it: *ArgsIterator, diag: *Diagnostic) ParseError!?Payload(cmd) {
             const required_positionals = comptime countRequiredPositional(cmd);
 
             var res: Payload(cmd) = .{
@@ -89,17 +137,25 @@ pub fn Cli(comptime Context: type, comptime commands: []const Command) type {
             var only_positonal: bool = false;
 
             while (arg_it.next()) |arg| {
+                if (!only_positonal and isHelp(arg)) return null;
                 if (!only_positonal and std.mem.eql(u8, arg, "--")) {
                     only_positonal = true;
                 } else if (!only_positonal and arg.len > 1 and arg[0] == '-') {
-                    try parseOption(cmd, &res.options, arg, arg_it);
+                    try parseOption(cmd, &res.options, arg, arg_it, diag);
                 } else {
-                    try setPositional(cmd, &res.positionals, pos_index, arg);
+                    try setPositional(cmd, &res.positionals, pos_index, arg, diag);
                     pos_index += 1;
                 }
             }
-            if (pos_index < required_positionals) return error.MissingPositionalArguements;
+            if (pos_index < required_positionals) return fail(diag, error.MissingPositionalArguements, null, positionalName(cmd, pos_index));
             return res;
+        }
+
+        fn positionalName(comptime cmd: Command, idx: usize) []const u8 {
+            inline for (@typeInfo(cmd.Positionals).@"struct".fields, 0..) |field, i| {
+                if (i == idx) return field.name;
+            }
+            unreachable;
         }
 
         fn countRequiredPositional(comptime cmd: Command) usize {
@@ -129,14 +185,21 @@ pub fn Cli(comptime Context: type, comptime commands: []const Command) type {
             return p;
         }
 
-        fn setPositional(comptime cmd: Command, positionals: *cmd.Positionals, index: usize, arg: []const u8) !void {
+        fn setPositional(
+            comptime cmd: Command,
+            positionals: *cmd.Positionals,
+            index: usize,
+            arg: []const u8,
+            diag: *Diagnostic,
+        ) ParseError!void {
             inline for (@typeInfo(cmd.Positionals).@"struct".fields, 0..) |field, i| {
                 if (i == index) {
-                    @field(positionals.*, field.name) = try parseValue(field.type, arg);
+                    @field(positionals.*, field.name) = parseValue(field.type, arg) catch |err|
+                        return fail(diag, err, arg, field.name);
                     return;
                 }
             }
-            return error.TooManyPositionalArguments;
+            return fail(diag, error.TooManyPositionalArguments, arg, null);
         }
 
         fn shortChar(comptime cmd: Command, field_name: []const u8) ?u8 {
@@ -145,7 +208,13 @@ pub fn Cli(comptime Context: type, comptime commands: []const Command) type {
             return s[0];
         }
 
-        fn parseShortCluster(comptime cmd: Command, options: *cmd.Options, arg: []const u8, arg_it: *ArgsIterator) !void {
+        fn parseShortCluster(
+            comptime cmd: Command,
+            options: *cmd.Options,
+            arg: []const u8,
+            arg_it: *ArgsIterator,
+            diag: *Diagnostic,
+        ) ParseError!void {
             var i: usize = 1; // skip '-'
             while (i < arg.len) : (i += 1) {
                 const char = arg[i];
@@ -156,21 +225,22 @@ pub fn Cli(comptime Context: type, comptime commands: []const Command) type {
                                 @field(options.*, field.name) = true;
                             } else {
                                 const rest = arg[i + 1 ..];
-                                if (rest.len > 0 and rest[0] == '=') return error.ShortFlagEqualValueSyntaxError;
-                                const value = if (rest.len > 0) rest else (arg_it.next() orelse return error.MissingValue);
-                                @field(options.*, field.name) = try parseValue(field.type, value);
+                                if (rest.len > 0 and rest[0] == '=') return fail(diag, error.ShortFlagEqualValueSyntaxError, arg, field.name);
+                                const value = if (rest.len > 0) rest else (arg_it.next() orelse return fail(diag, error.MissingValue, null, field.name));
+                                @field(options.*, field.name) = parseValue(field.type, value) catch |err|
+                                    return fail(diag, err, value, field.name);
                                 return;
                             }
                             break true;
                         }
                     }
                 } else false;
-                if (!matched) return error.UnknownOption;
+                if (!matched) return fail(diag, error.UnknownOption, arg[i .. i + 1], null);
             }
         }
 
-        fn parseOption(comptime cmd: Command, options: *cmd.Options, arg: []const u8, arg_it: *ArgsIterator) !void {
-            if (!std.mem.startsWith(u8, arg, "--")) return parseShortCluster(cmd, options, arg, arg_it);
+        fn parseOption(comptime cmd: Command, options: *cmd.Options, arg: []const u8, arg_it: *ArgsIterator, diag: *Diagnostic) ParseError!void {
+            if (!std.mem.startsWith(u8, arg, "--")) return parseShortCluster(cmd, options, arg, arg_it, diag);
 
             const arg_name: []const u8, const inline_value: ?[]const u8 =
                 if (std.mem.indexOfScalar(u8, arg, '=')) |i| .{ arg[2..i], arg[i + 1 ..] } else .{ arg[2..], null };
@@ -178,18 +248,26 @@ pub fn Cli(comptime Context: type, comptime commands: []const Command) type {
             inline for (@typeInfo(cmd.Options).@"struct".fields) |field| {
                 if (std.mem.eql(u8, arg_name, field.name)) {
                     if (field.type == bool) {
-                        @field(options.*, field.name) = if (inline_value) |v| try parseValue(field.type, v) else true;
+                        @field(options.*, field.name) = blk: {
+                            if (inline_value) |v| {
+                                break :blk parseValue(field.type, v) catch |err|
+                                    return fail(diag, err, v, field.name);
+                            } else {
+                                break :blk true;
+                            }
+                        };
                     } else {
-                        const value = inline_value orelse (arg_it.next() orelse return error.MissingValue);
-                        @field(options.*, field.name) = try parseValue(field.type, value);
+                        const value = inline_value orelse (arg_it.next() orelse return fail(diag, error.MissingValue, null, field.name));
+                        @field(options.*, field.name) = parseValue(field.type, value) catch |err|
+                            return fail(diag, err, value, field.name);
                     }
                     return;
                 }
             }
-            return error.UnknownOption;
+            return fail(diag, error.UnknownOption, arg[0 .. 2 + arg_name.len], null);
         }
 
-        fn parseValue(comptime T: type, arg: []const u8) !T {
+        fn parseValue(comptime T: type, arg: []const u8) ParseError!T {
             return switch (@typeInfo(T)) {
                 .bool => {
                     if (std.ascii.eqlIgnoreCase(arg, "true")) return true;
@@ -203,16 +281,6 @@ pub fn Cli(comptime Context: type, comptime commands: []const Command) type {
             };
         }
 
-        fn matches(comptime long: []const u8, comptime short: ?[]const u8, arg: []const u8) bool {
-            if (std.mem.startsWith(u8, arg, "--")) {
-                return std.mem.eql(u8, arg[2..], long);
-            }
-            if (short) |s| {
-                if (arg.len > 1 and arg[0] == '-') return std.mem.eql(u8, arg[1..], s);
-            }
-            return false;
-        }
-
         fn shortFor(comptime cmd: Command, comptime field_name: []const u8) ?[]const u8 {
             for (cmd.options_info) |info| {
                 if (std.mem.eql(u8, info.longname, field_name)) return info.shortname;
@@ -220,8 +288,8 @@ pub fn Cli(comptime Context: type, comptime commands: []const Command) type {
             return null;
         }
 
-        pub fn run(parsed: Parsed, ctx: Context) !void {
-            switch (parsed) {
+        pub fn run(invoked: Invoked, ctx: Context) !void {
+            switch (invoked) {
                 inline else => |payload, tag| {
                     const cmd = commands[@intFromEnum(tag)];
                     try call(cmd, ctx, payload);
