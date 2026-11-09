@@ -30,14 +30,15 @@ pub const ParseError = error{
 } || std.fmt.ParseFloatError || std.fmt.ParseIntError;
 
 pub const Config = struct {
-    usage: enum { auto, custom } = .auto,
-    helper: enum { auto, custom } = .auto,
-    program_name: ?[]const u8 = null,
+    program_name: []const u8 = "<Program_Name>",
     program_description: ?[]const u8 = null,
 };
 
 pub fn Cli(comptime Context: type, comptime commands: []const Command, comptime config: Config) type {
-    _ = config;
+    if (builtin.mode != .Debug and std.mem.eql(u8, config.program_name, "<Progam_Name>")) {
+        @compileError("Set Config.program_name before building a release.");
+    }
+
     for (commands) |cmd| {
         validateFields(cmd.Options);
         validateFields(cmd.Positionals);
@@ -46,7 +47,7 @@ pub fn Cli(comptime Context: type, comptime commands: []const Command, comptime 
     const cmds_len: usize = commands.len;
     return struct {
         pub const Tag = blk: {
-            const TagType: type = std.math.IntFittingRange(0, cmds_len + 1);
+            const TagType: type = std.math.IntFittingRange(0, cmds_len);
             var names: [cmds_len][]const u8 = undefined;
             var values: [cmds_len]TagType = undefined;
             for (commands, 0..) |cmd, i| {
@@ -74,10 +75,68 @@ pub fn Cli(comptime Context: type, comptime commands: []const Command, comptime 
             break :blk @Union(.auto, Tag, &n, &t, &a);
         };
 
+        pub fn usage(writer: *Io.Writer) Io.Writer.Error!void {
+            try writer.print("Usage: {s} [command] [options]\n", .{config.program_name});
+            inline for (commands, 0..) |command, i| {
+                try writer.print("  {s}", .{command.name});
+                if (i != commands.len - 1) try writer.writeByte('\n');
+            }
+        }
+
         pub const ParseResult = union(enum) {
             command: Invoked,
-            help: ?Tag,
+            help: Helper,
             err: Diagnostic,
+        };
+
+        pub const Helper = struct {
+            tag: ?Tag = null,
+
+            pub fn format(
+                self: @This(),
+                writer: *std.Io.Writer,
+            ) std.Io.Writer.Error!void {
+                if (self.tag) |tag| {
+                    switch (tag) {
+                        inline else => |t| {
+                            const cmd = commands[@intFromEnum(t)];
+
+                            const pos_fields = @typeInfo(cmd.Positionals).@"struct".fields;
+                            const options_fields = @typeInfo(cmd.Options).@"struct".fields;
+
+                            const pos: bool = if (pos_fields.len != 0) true else false;
+                            const opts: bool = if (options_fields.len != 0) true else false;
+
+                            try writer.print("Usage: {s} {s}", .{ config.program_name, cmd.name });
+                            if (pos) try writer.writeAll(" [positionals]");
+                            if (opts) try writer.writeAll(" [options]");
+                            if (pos or opts) try writer.writeAll("\n\n");
+
+                            if (pos) {
+                                try writer.writeAll("Positionals:\n");
+                                inline for (pos_fields, 0..) |field, i| {
+                                    try writer.print("  {s}: {s}", .{ field.name, @typeName(field.type) });
+                                    if (i != pos_fields.len - 1) try writer.writeByte('\n');
+                                }
+                            }
+                            if (opts) {
+                                try writer.writeAll("\n\n");
+                                try writer.writeAll("Options:\n");
+                                inline for (options_fields, 0..) |field, i| {
+                                    if (field.defaultValue()) |default| {
+                                        try writer.print("  {s}: {s} ({any})", .{ field.name, @typeName(field.type), default });
+                                    } else {
+                                        try writer.print("  {s}: {s}", .{ field.name, @typeName(field.type) });
+                                    }
+                                    if (i != options_fields.len - 1) try writer.writeByte('\n');
+                                }
+                            }
+                        },
+                    }
+                } else {
+                    try usage(writer);
+                }
+            }
         };
 
         pub const Diagnostic = struct {
@@ -85,6 +144,19 @@ pub fn Cli(comptime Context: type, comptime commands: []const Command, comptime 
             kind: ParseError = error.UnknownCommand,
             arg: ?[]const u8 = null,
             name: ?[]const u8 = null,
+
+            pub fn format(
+                self: @This(),
+                writer: *std.Io.Writer,
+            ) std.Io.Writer.Error!void {
+                switch (self.kind) {
+                    error.UnknownCommand => {
+                        try writer.print("{s}: Unknown command '{s}'\n", .{ config.program_name, self.arg.? });
+                        try writer.print("Try '{s} --help' for more information.\n", .{config.program_name});
+                    },
+                    else => try writer.writeAll("ELSE\n"),
+                }
+            }
         };
 
         fn Payload(comptime command: Command) type {
@@ -108,8 +180,9 @@ pub fn Cli(comptime Context: type, comptime commands: []const Command, comptime 
         pub fn parse(args: []const [:0]const u8) ParseResult {
             var arg_it = ArgsIterator.init(args);
             _ = arg_it.skip();
+
             if (arg_it.next()) |command_name| {
-                if (isHelp(command_name)) return .{ .help = null };
+                if (isHelp(command_name)) return .{ .help = .{ .tag = null } };
                 const tag = std.meta.stringToEnum(Tag, command_name) orelse return .{ .err = .{ .tag = null, .kind = error.UnknownCommand, .arg = command_name } };
                 switch (tag) {
                     inline else => |t| {
@@ -118,7 +191,7 @@ pub fn Cli(comptime Context: type, comptime commands: []const Command, comptime 
                         const payload = (parseCommandArgs(cmd, &arg_it, &diag) catch |err| {
                             assert(diag.kind == err);
                             return .{ .err = diag };
-                        }) orelse return .{ .help = t };
+                        }) orelse return .{ .help = .{ .tag = t } };
                         return .{ .command = @unionInit(Invoked, @tagName(t), payload) };
                     },
                 }
