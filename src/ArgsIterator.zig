@@ -47,7 +47,11 @@ pub fn rest(self: ArgsIterator) []const [:0]const u8 {
 
 /// Reset the iterator to its initial state.
 pub fn reset(self: *ArgsIterator) void {
-    self.seek = 0;
+    self.resetAt(0);
+}
+
+pub fn resetAt(self: *ArgsIterator, n: usize) void {
+    self.seek = n;
 }
 
 /// Skip 1 argument without capturing it. Returns `true` if skipped an arg, `false` if at the end.
@@ -55,6 +59,35 @@ pub fn skip(self: *ArgsIterator) bool {
     if (self.buffer[self.seek..].len == 0) return false;
     self.seek += 1;
     return true;
+}
+
+/// Scan arguments for `str`, returning `true` on first occurence. If not present, return `false`.
+/// Does not change the state of the Iterator.
+pub fn scanFor(self: *ArgsIterator, str: []const u8) bool {
+    const current_seek = self.seek;
+    while (self.next()) |arg| {
+        if (std.mem.eql(u8, arg, str)) {
+            self.resetAt(current_seek);
+            return true;
+        }
+    }
+    self.resetAt(current_seek);
+    return false;
+}
+
+/// Scan arguments for `str`, returnin the index of the first occurence. If not present, return `null`.
+/// Does not change the state of the Iterator.
+pub fn scanForPos(self: *ArgsIterator, str: []const u8) ?usize {
+    const current_seek = self.seek;
+    while (self.next()) |arg| {
+        if (std.mem.eql(u8, arg, str)) {
+            const idx = self.seek - 1; // Safety: Here self.seek is >= 1;
+            self.resetAt(current_seek);
+            return idx;
+        }
+    }
+    self.resetAt(current_seek);
+    return null;
 }
 
 test next {
@@ -104,6 +137,37 @@ test reset {
     try testing.expectEqual(0, it.seek);
 }
 
+test resetAt {
+    const args: []const [:0]const u8 = &.{ "abc", "def", "ghi" };
+    var it = ArgsIterator.init(args);
+    _ = it.next();
+    _ = it.next();
+    it.resetAt(1);
+    try testing.expectEqual(1, it.seek);
+}
+
+test scanFor {
+    const args: []const [:0]const u8 = &.{ "abc", "def", "ghi" };
+    var it = ArgsIterator.init(args);
+    try testing.expect(it.scanFor("def"));
+    try testing.expectEqual(0, it.seek);
+    try testing.expect(!it.scanFor("aze"));
+}
+
+test scanForPos {
+    {
+        const args: []const [:0]const u8 = &.{ "abc", "def", "ghi" };
+        var it = ArgsIterator.init(args);
+        try testing.expectEqual(2, it.scanForPos("ghi"));
+        try testing.expectEqual(null, it.scanForPos("aze"));
+    }
+    {
+        const args: []const [:0]const u8 = &.{};
+        var it = ArgsIterator.init(args);
+        try testing.expectEqual(null, it.scanForPos("ghi"));
+    }
+}
+
 test skip {
     const args: []const [:0]const u8 = &.{ "abc", "def" };
     var it = ArgsIterator.init(args);
@@ -112,5 +176,5 @@ test skip {
     try testing.expect(it.skip());
     try testing.expectEqual(it.seek, 2);
     try testing.expect(!it.skip());
-    try testing.expectEqual(it.seek, 3);
+    try testing.expectEqual(it.seek, 2);
 }
