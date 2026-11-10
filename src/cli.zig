@@ -190,6 +190,9 @@ pub fn Cli(comptime Context: type, comptime commands: []const Command, comptime 
                         const cmd = commands[@intFromEnum(t)];
                         const payload = (parseCommandArgs(cmd, &arg_it, &diag) catch |err| {
                             assert(diag.kind == err);
+                            if (arg_it.scanFor("--help") or arg_it.scanFor("-h")) {
+                                return .{ .help = .{ .tag = t } };
+                            }
                             return .{ .err = diag };
                         }) orelse return .{ .help = .{ .tag = t } };
                         return .{ .command = @unionInit(Invoked, @tagName(t), payload) };
